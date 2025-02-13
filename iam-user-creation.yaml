@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFormation template to create IAM users, groups, event rule, and Lambda function."
+
+Parameters:
+  S3UserEmail:
+    Type: String
+    Default: "s3-user@example.com"
+    Description: "Email address for S3 user"
+  
+  EC2UserEmail:
+    Type: String
+    Default: "ec2-user@example.com"
+    Description: "Email address for EC2 user"
+
+Resources:
+  # Generate a One-Time Password and store in Secrets Manager
+  OneTimePassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-temp-password"
+      Description: "One-Time Password for IAM users"
+      GenerateSecretString:
+        PasswordLength: 12
+        ExcludePunctuation: true
+
+  # Create IAM Group for S3 read access
+  S3UserGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: S3ReadOnlyGroup
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  # Create IAM Group for EC2 read access
+  EC2UserGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: EC2ReadOnlyGroup
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+
+  # Create IAM User for S3 and assign to S3 Group
+  S3User:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: s3-user
+      Groups:
+        - !Ref S3UserGroup
+      LoginProfile:
+        Password: !Sub "{{resolve:secretsmanager:${OneTimePassword}}}"
+        PasswordResetRequired: true
+
+  # Store S3 User Email in SSM Parameter Store
+  S3UserEmailParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/s3-user/email"
+      Type: String
+      Value: !Ref S3UserEmail
+
+  # Create IAM User for EC2 and assign to EC2 Group
+  EC2User:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: ec2-user
+      Groups:
+        - !Ref EC2UserGroup
+      LoginProfile:
+        Password: !Sub "{{resolve:secretsmanager:${OneTimePassword}}}"
+        PasswordResetRequired: true
+
+  # Store EC2 User Email in SSM Parameter Store
+  EC2UserEmailParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/ec2-user/email"
+      Type: String
+      Value: !Ref EC2UserEmail
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaIAMUserLoggerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref OneTimePassword
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: 
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+
+  # Lambda Function
+  UserCreationLoggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-user-logger"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          AWS_STACK_NAME: !Ref AWS::StackName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              try:
+                  # Debug print to see the incoming event
+                  print("Received event:", json.dumps(event))
+                  
+                  # Initialize AWS clients
+                  ssm = boto3.client('ssm')
+                  secrets = boto3.client('secretsmanager')
+                  
+                  # Extract username from the event with better error handling
+                  if 'detail' in event:
+                      # This is an EventBridge event
+                      detail = event['detail']
+                      if 'requestParameters' in detail:
+                          request_parameters = detail['requestParameters']
+                          if isinstance(request_parameters, str):
+                              request_parameters = json.loads(request_parameters)
+                          user_name = request_parameters.get('userName')
+                      else:
+                          raise ValueError("No requestParameters in event detail")
+                  else:
+                      # This might be a test event
+                      print("No detail field found in event. This might be a test event.")
+                      user_name = "test-user"  # Use a default for testing
+                  
+                  if not user_name:
+                      raise ValueError("Could not extract username from event")
+                      
+                  print(f"Processing for user: {user_name}")
+                  
+                  # Get user email from Parameter Store
+                  stack_name = os.environ.get('AWS_STACK_NAME', '')
+                  email_parameter = f'/{stack_name}/{user_name}/email'
+                  print(f"Looking for parameter: {email_parameter}")
+                  
+                  try:
+                      user_email = ssm.get_parameter(
+                          Name=email_parameter
+                      )['Parameter']['Value']
+                  except Exception as e:
+                      print(f"Error getting email parameter: {str(e)}")
+                      user_email = "example@example.com"  # Fallback for testing
+                  
+                  # Get temporary password from Secrets Manager
+                  secret_name = f'{stack_name}-temp-password'
+                  print(f"Looking for secret: {secret_name}")
+                  
+                  try:
+                      temp_password = secrets.get_secret_value(
+                          SecretId=secret_name
+                      )['SecretString']
+                  except Exception as e:
+                      print(f"Error getting secret: {str(e)}")
+                      temp_password = "test-password"  # Fallback for testing
+                  
+                  # Log the information
+                  message = f"New user created - Username: {user_name}, Email: {user_email}, Temporary Password: {temp_password}"
+                  print(message)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Successfully processed user creation event')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing event: {str(e)}")
+                  print(f"Event structure: {json.dumps(event)}")
+                  raise e
+
+  # EventBridge Rule
+  UserCreationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-user-creation-rule"
+      Description: "Trigger Lambda on new IAM user creation"
+      EventPattern:
+        source:
+          - "aws.iam"
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - "iam.amazonaws.com"
+          eventName:
+            - "CreateUser"
+      Targets:
+        - Arn: !GetAtt UserCreationLoggerFunction.Arn
+          Id: "IAMUserLoggerLambda"
+
+  # Lambda Permission
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UserCreationLoggerFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt UserCreationEventRule.Arn
+
+Outputs:
+  OneTimePasswordSecret:
+    Value: !Ref OneTimePassword
+    Description: "Secret name storing the one-time password"
+
+  LambdaFunction:
+    Value: !GetAtt UserCreationLoggerFunction.Arn
+    Description: "Lambda function ARN"
+
+  EventRule:
+    Value: !Ref UserCreationEventRule
+    Description: "EventBridge Rule detecting IAM user creation"
